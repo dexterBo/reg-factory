@@ -626,19 +626,17 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
         for _consent_try in range(5):
             page_text = await page.evaluate("() => document.body.innerText")
             current_url = page.url.lower()
-            # Check if on a consent/privacy page (not the actual signup form)
-            # Only trigger for actual privacy/consent standalone pages, not signup pages with footer links
-            is_signup_form = "signup.live.com" in current_url and "privacynotice" not in current_url
-            if not is_signup_form and (
-                any(kw in page_text for kw in ["同意并继续", "个人数据", "数据导出"]) or \
-                any(kw in page_text.lower() for kw in [
-                    "agree and continue", "consent", "data export",
-                    "accepter et continuer", "consentement",
-                ]) or "privacynotice" in current_url
-            ):
+            is_privacy_notice = any(kw in page_text for kw in [
+                "同意并继续", "个人数据导出许可", "个人数据", "数据导出",
+                "隐私声明", "隐私", "隐私政策",
+            ]) or any(kw in page_text.lower() for kw in [
+                "agree and continue", "accept and continue", "consent", "data export",
+                "privacy notice", "privacy policy", "personal data",
+            ]) or "privacynotice" in current_url or "privacy" in current_url
+
+            if is_privacy_notice:
                 print(f"  {tag} privacy/consent page detected, clicking accept...")
                 clicked = False
-                # Try various accept buttons
                 for sel in [
                     'button:has-text("同意并继续")', 'input[value="同意并继续"]',
                     'button:has-text("同意")', 'a:has-text("同意并继续")',
@@ -659,13 +657,16 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                         except Exception:
                             pass
                 if not clicked:
-                    # Fallback: click any visible button
                     try:
                         await page.evaluate("""() => {
-                            const btns = document.querySelectorAll('button, input[type="submit"], a.btn');
+                            const btns = document.querySelectorAll('button, input[type="submit"], a, span');
                             for (const b of btns) {
-                                if (b.offsetParent !== null && b.textContent.length < 30) {
-                                    b.click(); return true;
+                                if (b.offsetParent !== null) {
+                                    const text = (b.textContent || '').trim();
+                                    if (/^(同意|同意并继续|接受|继续|Agree|Accept|Continue|OK|Accepter|Continuer|Suivant)$/i.test(text)) {
+                                        b.click();
+                                        return true;
+                                    }
                                 }
                             }
                             return false;

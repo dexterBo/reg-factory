@@ -526,6 +526,62 @@ async def register_outlook(page):
         await asyncio.sleep(3)
         await page.screenshot(path="screenshots/outlook_start.png")
 
+        # Handle privacy/consent pages before signup form appears
+        for _consent_try in range(5):
+            page_text = await page.evaluate("() => document.body.innerText")
+            current_url = page.url.lower()
+            is_privacy_notice = any(kw in page_text for kw in [
+                "同意并继续", "个人数据导出许可", "个人数据", "数据导出",
+                "隐私声明", "隐私", "隐私政策",
+            ]) or any(kw in page_text.lower() for kw in [
+                "agree and continue", "accept and continue", "consent", "data export",
+                "privacy notice", "privacy policy", "personal data",
+            ]) or "privacynotice" in current_url or "privacy" in current_url
+            if is_privacy_notice:
+                print("  [outlook] privacy/consent page detected, clicking accept...")
+                clicked = False
+                for sel in [
+                    'button:has-text("同意并继续")', 'input[value="同意并继续"]',
+                    'button:has-text("同意")', 'a:has-text("同意并继续")',
+                    'button:has-text("Agree and continue")', 'button:has-text("Accept")',
+                    'button:has-text("Continue")', 'button:has-text("OK")',
+                    'button:has-text("Accepter et continuer")', 'button:has-text("Accepter")',
+                    'button:has-text("Continuer")', 'button:has-text("Suivant")',
+                    'input[type="submit"]', 'button[type="submit"]',
+                    '#iNext', '#iAgree', '#acceptButton',
+                ]:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0:
+                        try:
+                            await btn.click(timeout=5000)
+                            print(f"  [outlook] clicked consent: {sel}")
+                            clicked = True
+                            break
+                        except Exception:
+                            pass
+                if not clicked:
+                    try:
+                        await page.evaluate("""() => {
+                            const btns = document.querySelectorAll('button, input[type="submit"], a, span');
+                            for (const b of btns) {
+                                if (b.offsetParent !== null) {
+                                    const text = (b.textContent || '').trim();
+                                    if (/^(同意|同意并继续|接受|继续|Agree|Accept|Continue|OK|Accepter|Continuer|Suivant)$/i.test(text)) {
+                                        b.click();
+                                        return true;
+                                    }
+                                }
+                            }
+                            return false;
+                        }""")
+                        print("  [outlook] JS-clicked consent button")
+                    except Exception:
+                        pass
+                await asyncio.sleep(3)
+                await page.screenshot(path="screenshots/outlook_after_consent.png")
+            else:
+                break
+
         # 生成邮箱和密码（前缀必须以字母开头）
         prefix = random.choice(string.ascii_lowercase) + "".join(random.choices(string.ascii_lowercase + string.digits, k=11))
         email = f"{prefix}@outlook.com"
