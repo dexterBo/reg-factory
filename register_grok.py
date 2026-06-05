@@ -26,12 +26,22 @@ if sys.platform == "win32":
 sys.path.insert(0, ".")
 from playwright.async_api import async_playwright
 
+import requests
+
 from bitbrowser import BitBrowser
 from common.browser import inject_stealth, create_browser_with_retry, human_type
 from common.mailbox import get_code_outlook_pw
 from common.cookies import save_platform_cookies
 from common import emails as email_pool
 from common import proxy_switch
+
+# 打码平台 key（解 Cloudflare Turnstile）。config 顶部会加载 .env，真实环境变量优先。
+try:
+    from config import CAPSOLVER_API_KEY, EZCAPTCHA_API_KEY, EZCAPTCHA_API_BASE
+except Exception:
+    CAPSOLVER_API_KEY = ""
+    EZCAPTCHA_API_KEY = ""
+    EZCAPTCHA_API_BASE = "https://api.ez-captcha.com"
 
 PLATFORM = "grok"
 GROK_URL = "https://grok.com/"
@@ -58,6 +68,209 @@ COMPLETE_BTN = ["登録を完了", "アカウントを作成", "Complete registr
 
 GROK_SENDER = ("x.ai", "grok", "noreply", "no-reply")
 GROK_SUBJECT = ("code", "verify", "verification", "grok", "x.ai", "confirm", "確認", "認証", "コード", "验证", "驗證")
+
+
+# 在 turnstile 脚本加载前 hook window.turnstile.render，截获 React 传入的 callback + sitekey。
+# 这是给 React 表单灌打码 token 的关键:x.ai 用 callback(token) 更新组件 state 来解禁"完成注册",
+# 只改隐藏的 cf-turnstile-response 值 React 收不到。用属性 setter 拦截 window.turnstile 赋值,
+# 一旦 CF 脚本设置它就立刻包裹 render,把 opts.callback/sitekey/action/cData 存到 window.__cf*。
+TURNSTILE_HOOK_JS = r"""
+(() => {
+  if (window.__cfHookInstalled) return;
+  window.__cfHookInstalled = true;
+  window.__cfCb = [];
+  const wrap = (v) => {
+    if (v && typeof v.render === 'function' && !v.__hooked) {
+      const orig = v.render.bind(v);
+      v.render = (el, opts) => {
+        try {
+          if (opts) {
+            if (opts.callback) window.__cfCb.push(opts.callback);
+            window.__cfSitekey = opts.sitekey || window.__cfSitekey;
+            window.__cfAction  = opts.action  || window.__cfAction;
+            window.__cfCdata   = opts.cData || opts.cdata || window.__cfCdata;
+          }
+        } catch (e) {}
+        return orig(el, opts);
+      };
+      v.__hooked = true;
+    }
+    return v;
+  };
+  let _ts = window.turnstile ? wrap(window.turnstile) : undefined;
+  try {
+    Object.defineProperty(window, 'turnstile', {
+      configurable: true,
+      get() { return _ts; },
+      set(v) { _ts = wrap(v); },
+    });
+  } catch (e) {}
+})();
+"""
+
+
+async def _turnstile_token(page):
+    """读当前 cf-turnstile-response 的值(有值=已过)。"""
+    try:
+        return await page.evaluate(
+            "() => { const e=document.querySelector('input[name=\"cf-turnstile-response\"],textarea[name=\"cf-turnstile-response\"]'); return e ? e.value : null; }"
+        )
+    except Exception:
+        return None
+
+
+async def _extract_sitekey(page):
+    """提取 Turnstile sitekey:优先 hook 截获的 window.__cfSitekey,
+    再退化到 [data-sitekey] 属性,最后从 challenges.cloudflare.com iframe 的 url 里抠 0x... 串。"""
+    try:
+        return await page.evaluate(r"""() => {
+            if (window.__cfSitekey) return window.__cfSitekey;
+            const el = document.querySelector('[data-sitekey]');
+            if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');
+            for (const f of document.querySelectorAll('iframe')) {
+                const src = f.src || '';
+                if (src.includes('challenges.cloudflare.com')) {
+                    const m = src.match(/(0x[0-9A-Za-z_-]{10,})/);
+                    if (m) return m[1];
+                }
+            }
+            return null;
+        }""")
+    except Exception:
+        return None
+
+
+def _solve_turnstile_capsolver(sitekey, page_url, action=None, cdata=None, max_wait=130):
+    """CapSolver 解 Cloudflare Turnstile,返回 token 或 None。"""
+    if not CAPSOLVER_API_KEY:
+        return None
+    try:
+        task = {"type": "AntiTurnstileTaskProxyLess", "websiteURL": page_url, "websiteKey": sitekey}
+        meta = {}
+        if action:
+            meta["action"] = action
+        if cdata:
+            meta["cdata"] = cdata
+        if meta:
+            task["metadata"] = meta
+        resp = requests.post("https://api.capsolver.com/createTask",
+                             json={"clientKey": CAPSOLVER_API_KEY, "task": task}, timeout=30)
+        data = resp.json()
+        if data.get("errorId", 1) != 0:
+            print(f"  [capsolver] create error: {data.get('errorDescription', data)}")
+            return None
+        task_id = data["taskId"]
+        print(f"  [capsolver] turnstile task: {task_id}")
+        start = time.time()
+        while time.time() - start < max_wait:
+            time.sleep(5)
+            r = requests.post("https://api.capsolver.com/getTaskResult",
+                              json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id}, timeout=30).json()
+            st = r.get("status")
+            if st == "ready":
+                tok = r.get("solution", {}).get("token")
+                print(f"  [capsolver] solved (token len={len(tok or '')})")
+                return tok
+            if st == "failed" or r.get("errorId"):
+                print(f"  [capsolver] failed: {r.get('errorDescription', '')}")
+                return None
+        print("  [capsolver] timeout")
+        return None
+    except Exception as e:
+        print(f"  [capsolver] error: {str(e)[:80]}")
+        return None
+
+
+def _solve_turnstile_ezcaptcha(sitekey, page_url, max_wait=130):
+    """EZ-Captcha 解 Turnstile(备用),返回 token 或 None。"""
+    if not EZCAPTCHA_API_KEY:
+        return None
+    try:
+        resp = requests.post(f"{EZCAPTCHA_API_BASE}/createTask", json={
+            "clientKey": EZCAPTCHA_API_KEY,
+            "task": {"type": "TurnstileTaskProxyless", "websiteURL": page_url, "websiteKey": sitekey},
+        }, timeout=30)
+        data = resp.json()
+        if data.get("errorId", 1) != 0:
+            print(f"  [ezcaptcha] create error: {data.get('errorDescription', data)}")
+            return None
+        task_id = data["taskId"]
+        print(f"  [ezcaptcha] turnstile task: {task_id}")
+        start = time.time()
+        while time.time() - start < max_wait:
+            time.sleep(5)
+            r = requests.post(f"{EZCAPTCHA_API_BASE}/getTaskResult",
+                              json={"clientKey": EZCAPTCHA_API_KEY, "taskId": task_id}, timeout=30).json()
+            st = r.get("status")
+            if st == "ready":
+                tok = r.get("solution", {}).get("token")
+                print(f"  [ezcaptcha] solved (token len={len(tok or '')})")
+                return tok
+            if st == "failed" or r.get("errorId"):
+                print(f"  [ezcaptcha] failed: {r.get('errorDescription', '')}")
+                return None
+        print("  [ezcaptcha] timeout")
+        return None
+    except Exception as e:
+        print(f"  [ezcaptcha] error: {str(e)[:80]}")
+        return None
+
+
+async def _inject_turnstile_token(page, token):
+    """把打码拿到的 token 灌回页面:调 hook 截获的 callback(让 React 更新 state)+ 写隐藏字段。"""
+    try:
+        n = await page.evaluate(r"""(token) => {
+            let n = 0;
+            (window.__cfCb || []).forEach(cb => { try { cb(token); n++; } catch(e){} });
+            document.querySelectorAll('input[name="cf-turnstile-response"],textarea[name="cf-turnstile-response"]').forEach(e => {
+                try {
+                    const proto = e.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const set = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                    set.call(e, token);
+                    e.dispatchEvent(new Event('input', {bubbles: true}));
+                    e.dispatchEvent(new Event('change', {bubbles: true}));
+                } catch (err) {}
+            });
+            return n;
+        }""", token)
+        print(f"  [turnstile] token injected (callbacks fired={n})")
+        return True
+    except Exception as e:
+        print(f"  [turnstile] inject error: {str(e)[:80]}")
+        return False
+
+
+async def ensure_turnstile(page, page_url, passive_s=18):
+    """确保拿到 Turnstile token。先被动等 managed/交互式自动过;过不了再上打码平台解+回灌。
+    返回是否最终拿到 token。"""
+    # 1) 被动等:managed 模式自动过,或交互式复选框点一次
+    if await _wait_turnstile(page, max_s=passive_s):
+        return True
+    # 2) 打码兜底
+    if not (CAPSOLVER_API_KEY or EZCAPTCHA_API_KEY):
+        print("  [turnstile] 无打码 key(CAPSOLVER_API_KEY/EZCAPTCHA_API_KEY),跳过自动解码")
+        return False
+    sitekey = await _extract_sitekey(page)
+    if not sitekey:
+        print("  [turnstile] 取不到 sitekey,无法打码")
+        return False
+    action = await page.evaluate("() => window.__cfAction || null")
+    cdata = await page.evaluate("() => window.__cfCdata || null")
+    print(f"  [turnstile] solving via captcha service (sitekey={sitekey[:18]}...)")
+    loop = asyncio.get_event_loop()
+    token = await loop.run_in_executor(None, _solve_turnstile_capsolver, sitekey, page_url, action, cdata)
+    if not token:
+        token = await loop.run_in_executor(None, _solve_turnstile_ezcaptcha, sitekey, page_url)
+    if not token:
+        print("  [turnstile] 打码失败")
+        return False
+    await _inject_turnstile_token(page, token)
+    # 回灌后等表单 state 更新
+    for _ in range(6):
+        await asyncio.sleep(1)
+        if await _turnstile_token(page):
+            return True
+    return True  # 已调 callback,即使隐藏字段读不到也认为已灌入,交由提交校验
 
 
 def rand_password():
@@ -92,15 +305,95 @@ async def click_any(page, labels, timeout=5000):
     return None
 
 
-async def _wait_turnstile(page, max_s=90):
+async def _human_click_turnstile(page):
+    """用真实鼠标轨迹点 Turnstile 复选框（模拟手动点击）。
+    复选框在跨域 iframe 内，但 page.mouse 按视口坐标点击，所以拿 iframe/容器的 bounding box，
+    移动到左侧复选框位置（约 left+28、垂直居中）再点，比合成 .click() 更像真人、更易过交互式挑战。"""
+    try:
+        loc = None
+        for sel in ['.cf-turnstile', '[data-sitekey]', 'iframe[src*="challenges.cloudflare.com"]']:
+            cand = page.locator(sel).first
+            try:
+                if await cand.count() > 0 and await cand.is_visible():
+                    loc = cand
+                    break
+            except Exception:
+                continue
+        if loc is None:
+            return False
+        box = await loc.bounding_box()
+        if not box or box["width"] < 10:
+            return False
+        # 复选框一般在左侧；垂直居中。带点随机抖动
+        tx = box["x"] + min(30, box["width"] * 0.12) + random.uniform(-3, 3)
+        ty = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+        # 人类轨迹：先到附近 → 分步靠近 → 停顿 → 按下/抬起
+        await page.mouse.move(box["x"] - 40 + random.uniform(0, 20),
+                              ty - 25 + random.uniform(0, 15), steps=8)
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+        await page.mouse.move(tx, ty, steps=random.randint(12, 25))
+        await asyncio.sleep(random.uniform(0.15, 0.4))
+        await page.mouse.down()
+        await asyncio.sleep(random.uniform(0.05, 0.13))
+        await page.mouse.up()
+        print(f"  [turnstile] human-click @ ({int(tx)},{int(ty)})")
+        return True
+    except Exception as e:
+        print(f"  [turnstile] human-click err: {str(e)[:60]}")
+        return False
+
+
+async def _on_page_challenge(page):
+    """grok.com 是否卡在 Cloudflare 页面级挑战（Just a moment / __cf_chl 重定向）。"""
+    try:
+        if "__cf_chl" in (page.url or ""):
+            return True
+        has_cf = await page.evaluate(
+            "() => !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]')")
+        n = await page.evaluate("() => document.querySelectorAll('button,a,textarea').length")
+        body = ""
+        try:
+            body = (await page.locator("body").inner_text())[:200].lower()
+        except Exception:
+            pass
+        markers = ("just a moment", "verifying", "checking your browser", "请稍候", "正在验证")
+        if (has_cf or any(m in body for m in markers)) and n < 3:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def pass_page_challenge(page, tries=3):
+    """过 grok.com 页面级 CF 挑战：用真实鼠标点交互式 Turnstile（浏览器自身=节点IP 出 clearance），
+    等页面重定向回正常 SPA。页面级挑战的 cf_clearance 必须由真实浏览器在节点 IP 上拿，打码代解
+    的 proxyless token 对它无效，所以这里只靠模拟手动点击 + 等待 + 刷新。"""
+    for t in range(tries):
+        if not await _on_page_challenge(page):
+            return True
+        print(f"  [page-cf] challenge detected, human-click try {t+1}/{tries}")
+        await _human_click_turnstile(page)
+        for _ in range(12):  # 等离开挑战页 ~24s
+            await asyncio.sleep(2)
+            if not await _on_page_challenge(page):
+                print("  [page-cf] cleared")
+                await asyncio.sleep(2)
+                return True
+        try:
+            await page.reload(timeout=40000, wait_until="domcontentloaded")
+        except Exception:
+            pass
+        await asyncio.sleep(4)
+    return not await _on_page_challenge(page)
+
+
+async def _wait_turnstile(page, max_s=90, human_click=True):
     """等 Cloudflare Turnstile token：hidden input[name=cf-turnstile-response] 有值即过。
     返回是否拿到 token。
 
-    坑：x.ai 用的是**托管(managed)模式** Turnstile，多数情况无需交互、自己后台校验 IP/指纹后
-    自动填 token —— 此时千万别去点它（旧实现无脑点 iframe 的 body/label，反而可能打断校验、
-    且点了也拿不到 token，直接 'continuing anyway' 带空 token 提交 -> '完成注册' 被拦在原页）。
-    正确做法：先耐心轮询 token；**只有**真出现可见复选框(交互式 challenge)才点一次，点完继续等。
-    token 能否拿到强依赖出口 IP 信誉：数据中心节点常被 CF 判定需挑战甚至拿不到 token。"""
+    x.ai 多为**托管(managed)模式**：能自动过就让它过；过不了/出现交互式挑战时，**用真实鼠标
+    轨迹点一次复选框**（模拟手动点击，见 `_human_click_turnstile`）。token 能否拿到强依赖出口
+    IP 信誉——数据中心节点常被判定需挑战；点击过不了的，再由上层 `ensure_turnstile` 走打码兜底。"""
     clicked = False
     deadline = time.time() + max_s
     while time.time() < deadline:
@@ -113,21 +406,12 @@ async def _wait_turnstile(page, max_s=90):
         if val:
             print(f"  [turnstile] passed (token len={len(val)})")
             return True
-        # 仅当出现真正可见的复选框（交互式 challenge）才点一次；managed 模式没有复选框，不动它
-        if not clicked:
-            try:
-                for fr in page.frames:
-                    if "challenges.cloudflare.com" in (fr.url or ""):
-                        cb = fr.locator('input[type="checkbox"]')
-                        if await cb.count() > 0 and await cb.first.is_visible():
-                            await cb.first.click(timeout=3000)
-                            print("  [turnstile] clicked interactive checkbox")
-                            clicked = True
-                        break
-            except Exception:
-                pass
+        # 先给 managed 模式一点自动过的时间(~4s)，仍没过再模拟手动点一次
+        if human_click and not clicked and time.time() - (deadline - max_s) > 4:
+            if await _human_click_turnstile(page):
+                clicked = True
         await asyncio.sleep(2)
-    print("  [turnstile] token NOT obtained (IP 可能被 CF 判定需挑战；换节点重试)")
+    print("  [turnstile] token NOT obtained (IP 可能被 CF 判定需挑战；走打码或换节点)")
     return False
 
 
@@ -253,6 +537,11 @@ async def register_one(index, total, p, node):
         ctx = browser.contexts[0]
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         await inject_stealth(ctx, page)
+        # 在任何页面脚本前 hook turnstile.render，截获 callback/sitekey（供打码回灌用）
+        try:
+            await ctx.add_init_script(TURNSTILE_HOOK_JS)
+        except Exception as e:
+            print(f"  turnstile hook inject failed: {str(e)[:60]}")
 
         # Step 1: 打开 grok.com，等渲染
         print("  [1] goto grok.com (via proxy node)")
@@ -264,6 +553,10 @@ async def register_one(index, total, p, node):
                 print(f"  goto retry {attempt+1}: {str(e)[:50]}")
                 await asyncio.sleep(4)
         await wait_render(page)
+        # 页面级 CF 挑战（Just a moment/__cf_chl）：模拟手动点击过墙后再等渲染
+        if await _on_page_challenge(page):
+            await pass_page_challenge(page)
+            await wait_render(page, max_s=40)
         check_timeout()
 
         # 关 cookie 弹窗
@@ -403,11 +696,12 @@ async def register_one(index, total, p, node):
             await asyncio.sleep(1)
 
         # 等 Turnstile token + 点完成注册：拿到 token 才点（空 token 提交必被拦在原页）。
-        # 最多 3 轮：每轮先耐心等 token，再点完成；若仍停在 accounts.x.ai/sign-up 说明没过，
-        # 回到循环继续等 token（managed 模式有时晚到）再重点。
+        # ensure_turnstile = 被动等(managed自动过) → 模拟手动点复选框 → 打码平台解+回灌。
+        # 最多 3 轮：仍停在 accounts.x.ai/sign-up 说明没过，重等再点。
+        page_url = page.url
         completed = False
         for attempt in range(3):
-            has_token = await _wait_turnstile(page, max_s=60)
+            has_token = await ensure_turnstile(page, page_url, passive_s=18)
             done = await click_any(page, COMPLETE_BTN, timeout=8000)
             print(f"  [6] complete: btn={done} turnstile={has_token} (attempt {attempt+1}/3)")
             await asyncio.sleep(6)
@@ -434,6 +728,13 @@ async def register_one(index, total, p, node):
             ctx, PLATFORM, pid, email=email, password=password, key_cookie_names=KEY_COOKIES
         )
         if key_val:
+            # 导出标准 sso token（给 webchat2api/grok2api 用），失败不影响成功判定
+            try:
+                from common.session_export import save_grok_token
+                save_grok_token(key_val, email)
+                print("  [OK] grok sso token 已保存")
+            except Exception as e:
+                print(f"  [WARN] 保存 grok token 失败: {e}")
             email_pool.mark_used(PLATFORM, email, email_pw)
             success = True
             print("  [OK] session cookie saved")

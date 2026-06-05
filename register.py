@@ -3181,6 +3181,12 @@ async def save_cookies(context, profile_id, email=None, email_password=None):
             with open(accounts_file, "a", encoding="utf-8") as f:
                 f.write(f"{email}|{pwd}|{session_key}\n")
             print(f"  account saved to: {accounts_file}")
+        # 导出标准 token（Claude 登录态就是 sessionKey），失败不影响主流程
+        try:
+            from common.session_export import save_claude_token
+            save_claude_token(session_key, email)
+        except Exception as e:
+            print(f"  [WARN] 保存 claude 标准 token 失败: {e}")
         return session_key
     else:
         filename = os.path.join(COOKIE_OUTPUT_DIR, f"cookies_{profile_id}_{ts}.json")

@@ -348,6 +348,18 @@ async def register_one(index, total, p):
         key_val, _ = await save_platform_cookies(
             ctx, PLATFORM, pid, email=email, password=password, key_cookie_names=KEY_COOKIES
         )
+
+        # 导出标准 token（CPA codex / SUB2API content），失败不影响成功判定
+        try:
+            from common.session_export import fetch_chatgpt_session, save_chatgpt_tokens
+            sess = await fetch_chatgpt_session(page)
+            if sess and save_chatgpt_tokens(sess, email):
+                print("  [OK] chatgpt 标准 token 已保存")
+            else:
+                print("  [WARN] 未取到 chatgpt session（可能未完全登录）")
+        except Exception as e:
+            print(f"  [WARN] 保存标准 token 失败: {e}")
+
         if key_val:
             email_pool.mark_used(PLATFORM, email, email_pw)
             success = True

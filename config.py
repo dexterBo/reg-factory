@@ -87,3 +87,43 @@ CAPSOLVER_API_KEY = _env("CAPSOLVER_API_KEY", "")
 # EZ-Captcha 验证码打码平台
 EZCAPTCHA_API_KEY = _env("EZCAPTCHA_API_KEY", "")
 EZCAPTCHA_API_BASE = _env("EZCAPTCHA_API_BASE", "https://api.ez-captcha.com")
+
+# ---------------------------------------------------------------- 标准 token 导出/上传
+# 注册成功后落地的标准格式 token 目录（CPA codex / SUB2API content / grok sso）
+TOKEN_OUTPUT_DIR = _env("TOKEN_OUTPUT_DIR", "tokens")
+
+# CPA 管理接口（ChatGPT codex 授权文件导入）
+CPA_URL = _env("CPA_URL", "")
+CPA_MGMT_KEY = _env("CPA_MGMT_KEY", "")
+
+# SUB2API 管理接口（ChatGPT codex-session 导入）
+SUB2API_URL = _env("SUB2API_URL", "")
+SUB2API_EMAIL = _env("SUB2API_EMAIL", "")
+SUB2API_PASSWORD = _env("SUB2API_PASSWORD", "")
+SUB2API_GROUP = _env("SUB2API_GROUP", "codex")  # 目标分组名，需先在 SUB2API 后台建好
+
+# webchat2api（Grok sso 注入）
+WEBCHAT2API_URL = _env("WEBCHAT2API_URL", "")
+WEBCHAT2API_KEY = _env("WEBCHAT2API_KEY", "")
+
+# ---------------------------------------------------------------- 订阅授权入口
+# Codex / ChatGPT Plus：baxigpt.com（卡密 + 账号 access_token → 开通 Plus）
+BAXI_API = _env("BAXI_API", "https://baxigpt.com")
+# 卡密池：一个或多个 BX-XXXXXXXX，逗号/换行/空格分隔，方便批量
+BAXI_CARDS = [c.strip().upper() for c in _env("BAXI_CARDS", "").replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
+
+# Claude / SuperGrok 订阅入口（激活码 CDK 流程「敬请期待」，后续支持授权到 SUB2API / CPA）
+CLAUDE_SUB_URL = _env("CLAUDE_SUB_URL", "https://6661231.xyz/#/claude")
+GROK_SUB_URL = _env("GROK_SUB_URL", "https://6661231.xyz/#/grok")
+# 激活码 CDK 池（预留，逗号/换行/空格分隔）
+CLAUDE_SUB_CDK = [c.strip() for c in _env("CLAUDE_SUB_CDK", "").replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
+GROK_SUB_CDK = [c.strip() for c in _env("GROK_SUB_CDK", "").replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
+
+# ---------------------------------------------------------------- ChatGPT OAuth add-phone 接码
+# OpenAI/ChatGPT 在接码平台的服务号（按平台分，跟 Claude 的不同）
+SMS_PROJECT_ID_OPENAI = _env("SMS_PROJECT_ID_OPENAI", "")  # firefox.fun 的 ChatGPT 项目 iid（待填）
+HERO_SMS_SERVICE_OPENAI = _env("HERO_SMS_SERVICE_OPENAI", "dr")  # hero-sms/sms-activate OpenAI 服务码默认 dr
+# firefox.fun 价格上限：'0' 只取最便宜(垃圾号易被 OpenAI 拒)，给够才摸得到智利等好号
+SMS_MAXPRICE_OPENAI = _env("SMS_MAXPRICE_OPENAI", "20")
+# OpenAI add-phone 拉黑的号段(dialing code)：261 马达加斯加、63 菲律宾 等 OpenAI 常拒的
+SMS_COUNTRY_BLACKLIST_OPENAI = [c.strip() for c in _env("SMS_COUNTRY_BLACKLIST_OPENAI", "261,63").split(",") if c.strip()]
